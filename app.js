@@ -1,0 +1,2259 @@
+(() => {
+  'use strict';
+
+  /* ============================================================
+     trato. — V1 frontend
+     Radical honesty: salario, experiencia, modalidad, ubicación
+     y contacto son obligatorios. Datos en localStorage.
+     ============================================================ */
+
+  const STORAGE_JOBS = 'trato.jobs.v1';
+  const STORAGE_PROFILE = 'trato.profile.v1';
+  const STORAGE_REPORTS = 'trato.reports.v1';
+  const STORAGE_KARMA = 'trato.companyKarma.v1';
+
+  const MODALITIES = ['Remoto', 'Híbrido', 'Presencial'];
+  const CONTRACTS = ['Tiempo completo', 'Medio tiempo', 'Freelance', 'Pasantía'];
+  const AVAILABILITIES = ['Inmediata', 'En 2 semanas', 'En 1 mes', 'Flexible'];
+  const CITIES = ['Guayaquil', 'Quito', 'Cuenca', 'Manta', 'Loja', 'Ambato', 'Samborondón', 'Portoviejo', 'Machala', 'Riobamba', 'Ibarra', 'Esmeraldas'];
+  const PUBLISH_CITIES = ['Guayaquil', 'Quito', 'Cuenca', 'Remoto'];
+  const REPORT_REASONS = [
+    'Salario falso o engañoso',
+    'Requisitos engañosos',
+    'Proceso abusivo o discriminatorio',
+    'Spam o posible estafa',
+    'Otro'
+  ];
+  const LEVEL_FILTERS = [
+    { value: '1-3', label: 'Junior (1–3)' },
+    { value: '4-6', label: 'Semi senior (4–6)' },
+    { value: '7-10', label: 'Senior (7–10)' }
+  ];
+  const SALARY_FILTERS = [
+    { value: '500', label: '$500+ / mes' },
+    { value: '800', label: '$800+ / mes' },
+    { value: '1200', label: '$1,200+ / mes' },
+    { value: '2000', label: '$2,000+ / mes' }
+  ];
+
+  let app = null;
+  let toastTimeout = null;
+  let lastFocused = null;
+
+  /* ================= Utilidades ================= */
+
+  const $ = (selector, context = document) => context.querySelector(selector);
+  const $$ = (selector, context = document) => Array.from(context.querySelectorAll(selector));
+
+  const uid = () => {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID();
+    }
+    return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+  };
+
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[character]));
+
+  const norm = (value) => String(value ?? '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+
+  const money = (value) => '$' + Number(value || 0).toLocaleString('en-US');
+
+  const asList = (value) => Array.isArray(value) ? value : [];
+
+  const truncate = (value, max) => {
+    const text = String(value ?? '');
+    return text.length > max ? text.slice(0, max).trimEnd() + '…' : text;
+  };
+
+  const readFileAsDataURL = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('No se pudo leer el archivo.'));
+    reader.readAsDataURL(file);
+  });
+
+  const initials = (name) => {
+    const parts = String(name ?? '').trim().split(/\s+/).filter(Boolean);
+    return ((parts[0] && parts[0][0]) || '?').toUpperCase() + ((parts[1] && parts[1][0]) || '').toUpperCase();
+  };
+
+  const levelInfo = (level) => {
+    const number = Number(level);
+    if (number <= 2) return { band: 'Junior', detail: 'Bases sólidas, listo para aprender haciendo.' };
+    if (number <= 4) return { band: 'Junior avanzado', detail: 'Experiencia inicial con proyectos reales.' };
+    if (number <= 6) return { band: 'Semi senior', detail: 'Trabaja con autonomía y criterio propio.' };
+    if (number <= 8) return { band: 'Senior', detail: 'Resuelve problemas complejos y guía a otros.' };
+    return { band: 'Experto', detail: 'Referente técnico con trayectoria comprobada.' };
+  };
+
+  const salaryText = (job) => {
+    const min = Number(job.salaryMin);
+    const max = Number(job.salaryMax);
+    return min === max ? money(min) : `${money(min)} – ${money(max)}`;
+  };
+
+  const timeAgo = (timestamp) => {
+    const difference = Math.max(0, Date.now() - Number(timestamp || Date.now()));
+    const minutes = Math.floor(difference / 60000);
+    if (minutes < 60) return minutes <= 1 ? 'Hace un momento' : `Hace ${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `Hace ${hours} h`;
+    const days = Math.floor(hours / 24);
+    return days === 1 ? 'Hace 1 día' : `Hace ${days} días`;
+  };
+
+  const contactHref = (job) => {
+    const message = `Hola, vi la oferta de ${job.title} en trato y me interesa aplicar.`;
+    if (job.contactType === 'whatsapp') {
+      const digits = String(job.contact ?? '').replace(/\D/g, '');
+      return `https://wa.me/${digits}?text=${encodeURIComponent(message)}`;
+    }
+    return `mailto:${job.contact}?subject=${encodeURIComponent(`Aplicación: ${job.title}`)}&body=${encodeURIComponent(message)}`;
+  };
+
+  const profileContactHref = (profile) => {
+    const raw = String(profile.contact ?? '');
+    const message = `Hola ${profile.name}, vi tu perfil en trato y me gustaría conversar sobre una oportunidad.`;
+    if (raw.includes('@')) {
+      return `mailto:${raw}?subject=${encodeURIComponent(`Oportunidad para ${profile.name}`)}&body=${encodeURIComponent(message)}`;
+    }
+    const digits = raw.replace(/\D/g, '');
+    return `https://wa.me/${digits}?text=${encodeURIComponent(message)}`;
+  };
+
+  const defaultFilters = () => ({ q: '', city: '', modality: '', level: '', salary: '', urgent: false });
+  const defaultTalentFilters = () => ({ q: '', modality: '', city: '' });
+
+  const isHttpUrl = (value) => {
+    try {
+      const url = new URL(String(value));
+      return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const companyKey = (name) => norm(name).replace(/\s+/g, ' ');
+
+  const reportCount = (name) => {
+    const list = state.reports[companyKey(name)];
+    return Array.isArray(list) ? list.length : 0;
+  };
+
+  const isCompanyBlocked = (name) => reportCount(name) >= 3;
+
+  const getCompanyKarma = (name) => {
+    const value = Number(state.companyKarma[companyKey(name)]);
+    return Number.isFinite(value) ? value : 100;
+  };
+
+  const getWorkerKarma = (profile) => {
+    const value = Number(profile && profile.karma);
+    return Number.isFinite(value) ? value : 100;
+  };
+
+  /* ================= Datos de ejemplo ================= */
+
+  function seedJobs() {
+    const now = Date.now();
+    return [
+      {
+        id: uid(),
+        title: 'Desarrollador Frontend Junior',
+        company: 'Nébula Studio',
+        salaryMin: 700,
+        salaryMax: 950,
+        level: 2,
+        modality: 'Híbrido',
+        city: 'Quito',
+        schedule: 'Lun–Vie · 9:00–18:00',
+        contract: 'Tiempo completo',
+        urgent: true,
+        expiresAt: now + 36 * 3600000,
+        description: 'Buscamos una persona con bases de HTML, CSS y JavaScript para construir interfaces junto a nuestro equipo de producto. Valoramos curiosidad, criterio y ganas de aprender. No pedimos cinco años para un rol junior.',
+        skills: ['JavaScript', 'CSS', 'HTML', 'Git'],
+        contactType: 'email',
+        contact: 'hola@nebula.example',
+        createdAt: now - 2 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Diseñador UX/UI',
+        company: 'Marea Creative',
+        salaryMin: 900,
+        salaryMax: 1300,
+        level: 4,
+        modality: 'Remoto',
+        city: 'Guayaquil',
+        schedule: 'Flexible · 30–40 h/semana',
+        contract: 'Freelance',
+        urgent: false,
+        expiresAt: null,
+        description: 'Diseñamos productos digitales para marcas de la región. Buscamos a alguien que investigue, prototipe y cuide los detalles de interacción. Portafolio real, no una lista de herramientas.',
+        skills: ['Figma', 'UX Research', 'Prototipado', 'Design Systems'],
+        contactType: 'whatsapp',
+        contact: '+593 99 555 0101',
+        createdAt: now - 7 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Asistente Contable',
+        company: 'Andes Fintech',
+        salaryMin: 550,
+        salaryMax: 700,
+        level: 1,
+        modality: 'Presencial',
+        city: 'Quito',
+        schedule: 'Lun–Vie · 8:30–17:30',
+        contract: 'Tiempo completo',
+        urgent: false,
+        expiresAt: null,
+        description: 'Apoyo en conciliaciones, facturación y control de gastos. Buscamos a alguien ordenado, con bases de contabilidad y ganas de crecer dentro del equipo financiero. Se puede aprender el resto.',
+        skills: ['Excel', 'Contabilidad', 'Atención al detalle'],
+        contactType: 'email',
+        contact: 'talento@andesfintech.example',
+        createdAt: now - 12 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Community Manager',
+        company: 'Café Púrpura',
+        salaryMin: 500,
+        salaryMax: 650,
+        level: 2,
+        modality: 'Híbrido',
+        city: 'Cuenca',
+        schedule: 'Lun–Vie · 10:00–16:00',
+        contract: 'Medio tiempo',
+        urgent: false,
+        expiresAt: null,
+        description: 'Queremos una voz cercana para nuestras redes: contenido honesto, comunidad activa y respuesta real a clientes. No buscamos viralidad vacía; buscamos conversaciones que importen.',
+        skills: ['Redes sociales', 'Copywriting', 'Canva', 'Comunicación'],
+        contactType: 'email',
+        contact: 'equipo@cafepurpura.example',
+        createdAt: now - 20 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Backend Developer',
+        company: 'Pulso Labs',
+        salaryMin: 1500,
+        salaryMax: 2200,
+        level: 6,
+        modality: 'Remoto',
+        city: 'Quito',
+        schedule: 'Flexible · 40 h/semana',
+        contract: 'Tiempo completo',
+        urgent: false,
+        expiresAt: null,
+        description: 'Construimos herramientas de logística para LATAM. Necesitamos a alguien con experiencia real en APIs, bases de datos y despliegues. Trabajo remoto, equipo pequeño y decisiones técnicas compartidas.',
+        skills: ['Node.js', 'PostgreSQL', 'APIs', 'Docker'],
+        contactType: 'email',
+        contact: 'jobs@pulsolabs.example',
+        createdAt: now - 28 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Técnico de Soporte',
+        company: 'Ruta Verde',
+        salaryMin: 480,
+        salaryMax: 600,
+        level: 1,
+        modality: 'Presencial',
+        city: 'Manta',
+        schedule: 'Lun–Sáb · 8:00–16:00',
+        contract: 'Tiempo completo',
+        urgent: true,
+        expiresAt: now + 20 * 3600000,
+        description: 'Soporte presencial y remoto a clientes de nuestra red logística. Necesitamos paciencia, orden y ganas de resolver. Se valora experiencia con redes y equipos, pero no es obligatoria.',
+        skills: ['Soporte técnico', 'Redes', 'Paciencia'],
+        contactType: 'whatsapp',
+        contact: '+593 99 555 0102',
+        createdAt: now - 4 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Analista de Datos',
+        company: 'DataQuito',
+        salaryMin: 1100,
+        salaryMax: 1600,
+        level: 5,
+        modality: 'Híbrido',
+        city: 'Quito',
+        schedule: 'Lun–Vie · 9:00–18:00',
+        contract: 'Tiempo completo',
+        urgent: false,
+        expiresAt: null,
+        description: 'Buscamos a alguien que traduzca datos en decisiones claras para equipos de operaciones. SQL, visualización y criterio para preguntar lo correcto. No necesitas un doctorado; necesitas demostrar que sabes mirar los números.',
+        skills: ['SQL', 'Python', 'Power BI', 'Excel'],
+        contactType: 'email',
+        contact: 'datos@dataquito.example',
+        createdAt: now - 32 * 3600000
+      },
+      {
+        id: uid(),
+        title: 'Vendedor de Mostrador',
+        company: 'Textil Sur',
+        salaryMin: 460,
+        salaryMax: 550,
+        level: 1,
+        modality: 'Presencial',
+        city: 'Ambato',
+        schedule: 'Mar–Sáb · 9:00–18:00',
+        contract: 'Medio tiempo',
+        urgent: false,
+        expiresAt: null,
+        description: 'Atención al cliente en tienda, reposición de producto y cierre de caja. Buscamos personas responsables y amables. La experiencia previa suma, pero las ganas y la puntualidad pesan más.',
+        skills: ['Ventas', 'Atención al cliente', 'Caja'],
+        contactType: 'whatsapp',
+        contact: '+593 99 555 0103',
+        createdAt: now - 40 * 3600000
+      }
+    ];
+  }
+
+  const SEED_TALENT = [
+    {
+      id: 'talent-andrea',
+      name: 'Andrea Morales',
+      role: 'Diseñadora UX/UI',
+      level: 4,
+      city: 'Quito',
+      availability: 'Inmediata',
+      salary: 1100,
+      modality: 'Híbrido',
+      contact: 'andrea.morales@example.com',
+      skills: ['Figma', 'UX Research', 'Prototipado', 'Design Systems'],
+      experience: 'Tres años diseñando productos digitales para fintech y retail. He liderado investigaciones con usuarios y rediseños completos de flujos de compra.'
+    },
+    {
+      id: 'talent-mateo',
+      name: 'Mateo Cedeño',
+      role: 'Desarrollador Full Stack',
+      level: 6,
+      city: 'Guayaquil',
+      availability: 'En 2 semanas',
+      salary: 1800,
+      modality: 'Remoto',
+      contact: 'mateo.cedeno@example.com',
+      skills: ['JavaScript', 'Node.js', 'React', 'PostgreSQL'],
+      experience: 'Cinco años construyendo APIs y aplicaciones web para equipos de logística. Me gusta dejar el código mejor de como lo encontré.'
+    },
+    {
+      id: 'talent-sofia',
+      name: 'Sofía Zambrano',
+      role: 'Community & Content',
+      level: 3,
+      city: 'Cuenca',
+      availability: 'Inmediata',
+      salary: 750,
+      modality: 'Híbrido',
+      contact: 'sofia.zambrano@example.com',
+      skills: ['Copywriting', 'Redes sociales', 'Canva', 'Edición'],
+      experience: 'Dos años gestionando comunidades para marcas locales. Escribo claro, respondo rápido y mido lo que importa: conversación y confianza.'
+    },
+    {
+      id: 'talent-joaquin',
+      name: 'Joaquín Vera',
+      role: 'Analista de Datos',
+      level: 5,
+      city: 'Quito',
+      availability: 'En 1 mes',
+      salary: 1400,
+      modality: 'Presencial',
+      contact: '+593 98 555 0142',
+      skills: ['SQL', 'Python', 'Power BI', 'Excel'],
+      experience: 'Cuatro años analizando operaciones y ventas. Traduzco tableros en decisiones concretas y acompaño a los equipos en la implementación.'
+    },
+    {
+      id: 'talent-valentina',
+      name: 'Valentina Ríos',
+      role: 'Frontend Developer',
+      level: 3,
+      city: 'Manta',
+      availability: 'Flexible',
+      salary: 900,
+      modality: 'Remoto',
+      contact: 'valentina.rios@example.com',
+      skills: ['JavaScript', 'CSS', 'React', 'Accesibilidad'],
+      experience: 'Dos años creando interfaces accesibles y rápidas. Me obsesiona que la web funcione igual de bien en un teléfono antiguo que en una laptop nueva.'
+    }
+  ];
+
+  /* ================= Estado y persistencia ================= */
+
+  const state = {
+    jobs: [],
+    profile: null,
+    reports: {},
+    companyKarma: {},
+    tab: 'jobs',
+    filters: defaultFilters(),
+    talentFilters: defaultTalentFilters(),
+    editingProfile: false
+  };
+
+  function loadState() {
+    try {
+      const storedJobs = localStorage.getItem(STORAGE_JOBS);
+      const parsedJobs = storedJobs ? JSON.parse(storedJobs) : null;
+      state.jobs = Array.isArray(parsedJobs) && parsedJobs.length ? parsedJobs : seedJobs();
+    } catch (error) {
+      state.jobs = seedJobs();
+    }
+
+    try {
+      const storedProfile = localStorage.getItem(STORAGE_PROFILE);
+      const parsedProfile = storedProfile ? JSON.parse(storedProfile) : null;
+      state.profile = parsedProfile && typeof parsedProfile === 'object' ? parsedProfile : null;
+    } catch (error) {
+      state.profile = null;
+    }
+
+    try {
+      const storedReports = localStorage.getItem(STORAGE_REPORTS);
+      const parsedReports = storedReports ? JSON.parse(storedReports) : null;
+      state.reports = parsedReports && typeof parsedReports === 'object' && !Array.isArray(parsedReports) ? parsedReports : {};
+    } catch (error) {
+      state.reports = {};
+    }
+
+    try {
+      const storedKarma = localStorage.getItem(STORAGE_KARMA);
+      const parsedKarma = storedKarma ? JSON.parse(storedKarma) : null;
+      state.companyKarma = parsedKarma && typeof parsedKarma === 'object' && !Array.isArray(parsedKarma) ? parsedKarma : {};
+    } catch (error) {
+      state.companyKarma = {};
+    }
+  }
+
+  function saveJobs() {
+    try {
+      localStorage.setItem(STORAGE_JOBS, JSON.stringify(state.jobs));
+    } catch (error) {
+      toast('No se pudo guardar en este navegador. La oferta vive solo en esta sesión.');
+    }
+  }
+
+  function saveProfile() {
+    try {
+      localStorage.setItem(STORAGE_PROFILE, JSON.stringify(state.profile));
+    } catch (error) {
+      toast('No se pudo guardar el perfil en este navegador.');
+    }
+  }
+
+  function saveReports() {
+    try {
+      localStorage.setItem(STORAGE_REPORTS, JSON.stringify(state.reports));
+    } catch (error) {
+      toast('No se pudo guardar el reporte en este navegador.');
+    }
+  }
+
+  function saveCompanyKarma() {
+    try {
+      localStorage.setItem(STORAGE_KARMA, JSON.stringify(state.companyKarma));
+    } catch (error) {
+      toast('No se pudo guardar el karma en este navegador.');
+    }
+  }
+
+  function adjustCompanyKarma(name, delta) {
+    const key = companyKey(name);
+    const next = Math.max(0, getCompanyKarma(name) + Number(delta || 0));
+    state.companyKarma[key] = next;
+    saveCompanyKarma();
+    return next;
+  }
+
+  function getTalent() {
+    const own = state.profile ? [Object.assign({}, state.profile, { isOwn: true })] : [];
+    return own.concat(SEED_TALENT.map((profile) => Object.assign({}, profile)));
+  }
+
+  /* ================= Filtros y matching ================= */
+
+  function filteredJobs() {
+    const filters = state.filters;
+    const query = norm(filters.q);
+    let jobs = state.jobs.slice();
+
+    if (query) {
+      jobs = jobs.filter((job) => norm([
+        job.title,
+        job.company,
+        job.city,
+        job.description,
+        asList(job.skills).join(' ')
+      ].join(' ')).includes(query));
+    }
+
+    if (filters.city) jobs = jobs.filter((job) => norm(job.city) === norm(filters.city));
+    if (filters.modality) jobs = jobs.filter((job) => job.modality === filters.modality);
+
+    if (filters.level) {
+      const range = filters.level.split('-').map(Number);
+      jobs = jobs.filter((job) => Number(job.level) >= range[0] && Number(job.level) <= range[1]);
+    }
+
+    if (filters.salary) jobs = jobs.filter((job) => Number(job.salaryMax) >= Number(filters.salary));
+    if (filters.urgent) jobs = jobs.filter((job) => Boolean(job.urgent));
+
+    return jobs.sort((a, b) =>
+      (Number(Boolean(b.featured)) - Number(Boolean(a.featured))) ||
+      (Number(b.urgent) - Number(a.urgent)) ||
+      (Number(b.createdAt) - Number(a.createdAt))
+    );
+  }
+
+  function filteredTalent() {
+    const filters = state.talentFilters;
+    const query = norm(filters.q);
+    let talent = getTalent();
+
+    if (query) {
+      talent = talent.filter((profile) => norm([
+        profile.name,
+        profile.role,
+        profile.city,
+        profile.experience,
+        asList(profile.skills).join(' ')
+      ].join(' ')).includes(query));
+    }
+
+    if (filters.modality) talent = talent.filter((profile) => profile.modality === filters.modality);
+    if (filters.city) talent = talent.filter((profile) => norm(profile.city) === norm(filters.city));
+
+    return talent.sort((a, b) => (Number(Boolean(b.isOwn)) - Number(Boolean(a.isOwn))) || (Number(b.level) - Number(a.level)));
+  }
+
+  function matchScore(job, profile) {
+    if (!profile) return null;
+
+    let score = 0;
+    const reasons = [];
+    const jobSkills = asList(job.skills).map(norm);
+    const profileSkills = asList(profile.skills).map(norm);
+
+    const overlap = jobSkills.filter((skill) =>
+      profileSkills.some((mine) => mine === skill || mine.includes(skill) || skill.includes(mine))
+    );
+
+    if (overlap.length > 0) {
+      score += Math.min(45, 15 + overlap.length * 10);
+      reasons.push(`${overlap.length} habilidad${overlap.length === 1 ? '' : 'es'} en común`);
+    }
+
+    const profileLevel = Number(profile.level) || 1;
+    const jobLevel = Number(job.level) || 1;
+
+    if (profileLevel >= jobLevel) {
+      score += 20;
+      reasons.push('Tu nivel cumple el requisito');
+    } else if (profileLevel + 1 >= jobLevel) {
+      score += 10;
+      reasons.push('Nivel casi compatible');
+    }
+
+    if (profile.modality === job.modality) {
+      score += 12;
+      reasons.push('Misma modalidad');
+    }
+
+    if (job.modality === 'Remoto') {
+      score += 13;
+      reasons.push('Trabajo remoto');
+    } else if (norm(profile.city) === norm(job.city)) {
+      score += 13;
+      reasons.push('Misma ciudad');
+    }
+
+    if (Number(profile.salary) <= Number(job.salaryMax)) {
+      score += 10;
+      reasons.push('Salario dentro de tu aspiración');
+    }
+
+    return { score: Math.min(100, score), reasons };
+  }
+
+  /* ================= Render principal ================= */
+
+  function buildShell() {
+    document.title = 'trato. — Empleo honesto en Ecuador';
+    app.innerHTML = `
+      <header class="site-header">
+        <div class="container header-inner">
+          <button class="logo" type="button" data-tab="jobs" aria-label="Ir a empleos">trato<span>.</span></button>
+          <nav class="nav" aria-label="Navegación principal">
+            <button type="button" data-tab="jobs">Empleos</button>
+            <button type="button" data-tab="talent">Talento</button>
+            <button type="button" data-tab="publish">Publicar</button>
+            <button type="button" data-tab="profile">Mi perfil</button>
+          </nav>
+        </div>
+      </header>
+
+      <main id="view" class="container"></main>
+
+      <div class="container">
+        <aside class="ad-strip" aria-label="Publicidad">
+          <span class="ad-tag">Publicidad</span>
+          <span>Espacio para patrocinios locales · Llega a talento de Guayaquil y Ecuador.</span>
+          <a href="mailto:publicidad@trato.example?subject=Patrocinio%20en%20trato">Patrocinar →</a>
+        </aside>
+      </div>
+
+      <footer class="site-footer">
+        <div class="container footer-inner">
+          <div>
+            <strong>trato.</strong>
+            <div>Empleo honesto para LATAM. Piloto: Ecuador.</div>
+            <div class="tiny">Datos guardados solo en este navegador (demo V1).</div>
+          </div>
+          <div class="footer-links">
+            <span>Salarios visibles · Requisitos reales · Contacto directo</span>
+            <button class="link-btn" type="button" data-reset>Reiniciar demo</button>
+          </div>
+        </div>
+      </footer>
+
+      <div id="modal-root"></div>
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    `;
+  }
+
+  function renderView() {
+    const view = document.getElementById('view');
+    if (!view) return;
+
+    $$('.nav [data-tab]').forEach((button) => {
+      if (button.dataset.tab === state.tab) button.setAttribute('aria-current', 'page');
+      else button.removeAttribute('aria-current');
+    });
+
+    if (state.tab === 'publish') {
+      view.innerHTML = publishView();
+      return;
+    }
+
+    if (state.tab === 'talent') {
+      view.innerHTML = talentView();
+      updateTalentResults();
+      return;
+    }
+
+    if (state.tab === 'profile') {
+      view.innerHTML = profileView();
+      return;
+    }
+
+    view.innerHTML = jobsView();
+    updateJobResults();
+  }
+
+  function setTab(tab) {
+    if (!['jobs', 'publish', 'talent', 'profile'].includes(tab)) return;
+    closeModal();
+    state.tab = tab;
+    if (tab !== 'profile') state.editingProfile = false;
+    renderView();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  /* ================= Vista: empleos ================= */
+
+  function jobsView() {
+    const profile = state.profile;
+    const companies = new Set(state.jobs.map((job) => job.company)).size;
+    const urgent = state.jobs.filter((job) => job.urgent).length;
+
+    return `
+      <section class="hero">
+        <span class="eyebrow">Honestidad radical · Ecuador</span>
+        <h1>Empleo honesto.<br><em>Sin vueltas.</em></h1>
+        <p>Salarios reales, requisitos reales y contacto directo. Encuentra trabajo en minutos, no en meses. Y si eres empresa, publica con las cartas sobre la mesa.</p>
+        <div class="hero-actions">
+          <button class="btn btn-dark" type="button" data-tab="publish">Publicar una oferta</button>
+          <button class="btn btn-ghost" type="button" data-tab="profile">${profile ? 'Ver mi perfil' : 'Crear mi perfil'}</button>
+        </div>
+        <div class="hero-stats">
+          <span><strong>${state.jobs.length}</strong> ofertas honestas</span>
+          <span><strong>${companies}</strong> empresas</span>
+          <span><strong>${urgent}</strong> flash jobs</span>
+          <span><strong>100%</strong> con salario visible</span>
+        </div>
+      </section>
+
+      ${profile ? '' : `
+        <div class="profile-banner">
+          <p><strong>Tu match empieza con un perfil honesto.</strong> Crea el tuyo y descubre tu porcentaje de coincidencia en cada oferta.</p>
+          <button class="btn btn-green" type="button" data-tab="profile">Crear perfil gratis</button>
+        </div>
+      `}
+
+      <div class="search-panel">
+        <span class="search-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.6-3.6"></path></svg>
+        </span>
+        <input id="search" type="search" data-filter="q" value="${esc(state.filters.q)}" placeholder="Cargo, empresa o habilidad..." aria-label="Buscar empleos">
+      </div>
+
+      <div class="filters" role="group" aria-label="Filtros de empleo">
+        <select class="filter-select" data-filter="city" aria-label="Ubicación">${cityOptions()}</select>
+        <select class="filter-select" data-filter="modality" aria-label="Modalidad">${modalityOptions(state.filters.modality)}</select>
+        <select class="filter-select" data-filter="level" aria-label="Experiencia">
+          <option value="">Toda experiencia</option>
+          ${LEVEL_FILTERS.map((filter) => `<option value="${filter.value}" ${state.filters.level === filter.value ? 'selected' : ''}>${filter.label}</option>`).join('')}
+        </select>
+        <select class="filter-select" data-filter="salary" aria-label="Salario">
+          <option value="">Cualquier salario</option>
+          ${SALARY_FILTERS.map((filter) => `<option value="${filter.value}" ${state.filters.salary === filter.value ? 'selected' : ''}>${filter.label}</option>`).join('')}
+        </select>
+        <button class="chip-toggle" type="button" data-toggle-urgent aria-pressed="${state.filters.urgent}">⚡ Flash jobs</button>
+      </div>
+
+      <div class="results-head">
+        <span id="results-count"></span>
+        <button class="link-btn" type="button" data-clear-filters>Limpiar filtros</button>
+      </div>
+
+      <div id="job-grid" class="job-grid"></div>
+    `;
+  }
+
+  function cityOptions() {
+    const cities = Array.from(new Set(state.jobs.map((job) => job.city).filter(Boolean)))
+      .sort((a, b) => a.localeCompare(b, 'es'));
+    return `<option value="">Toda ubicación</option>` + cities.map((city) =>
+      `<option value="${esc(city)}" ${state.filters.city === city ? 'selected' : ''}>${esc(city)}</option>`
+    ).join('');
+  }
+
+  function modalityOptions(selected) {
+    return `<option value="">Toda modalidad</option>` + MODALITIES.map((modality) =>
+      `<option value="${esc(modality)}" ${selected === modality ? 'selected' : ''}>${esc(modality)}</option>`
+    ).join('');
+  }
+
+  function updateJobResults() {
+    const grid = document.getElementById('job-grid');
+    const count = document.getElementById('results-count');
+    if (!grid) return;
+
+    const jobs = filteredJobs();
+    if (count) count.textContent = `${jobs.length} ${jobs.length === 1 ? 'oferta' : 'ofertas'} · salario siempre visible`;
+
+    if (!jobs.length) {
+      grid.innerHTML = `
+        <div class="empty">
+          <strong>No hay ofertas con esos filtros.</strong>
+          <p>Prueba ampliar la búsqueda o limpiar los filtros.</p>
+          <button class="btn btn-dark" type="button" data-clear-filters>Limpiar filtros</button>
+        </div>
+      `;
+      return;
+    }
+
+    grid.innerHTML = jobs.map(jobCard).join('');
+  }
+
+  function jobCard(job) {
+    const match = state.profile ? matchScore(job, state.profile) : null;
+    const skills = asList(job.skills);
+    const blocked = isCompanyBlocked(job.company);
+    const reports = reportCount(job.company);
+    const karma = getCompanyKarma(job.company);
+
+    return `
+      <article class="job-card${job.urgent ? ' is-urgent' : ''}${blocked ? ' is-blocked' : ''}">
+        <div class="card-flags">
+          <div class="flag-group">
+            ${job.urgent
+              ? '<span class="badge flash">⚡ FLASH JOB — 24–48H</span>'
+              : '<span class="badge subtle">Oferta transparente</span>'}
+            ${job.featured ? '<span class="badge featured">★ Destacada</span>' : ''}
+            ${blocked ? '<span class="badge blocked">🚫 BLOQUEADA</span>' : ''}
+          </div>
+          ${match ? `<span class="badge match" title="${esc(match.reasons.join(' · '))}">${match.score}% match</span>` : ''}
+        </div>
+
+        <div class="job-heading">
+          <div>
+            <h3>${esc(job.title)}</h3>
+            <p class="job-company">
+              <span>${esc(job.company)} · ${esc(job.city)}</span>
+              <span class="karma-pill" title="Karma de la empresa">Karma ${karma}</span>
+              ${reports ? `<span class="report-count">${reports}/3 reportes</span>` : ''}
+              <button class="report-link" type="button" data-report="${esc(job.company)}" aria-label="Reportar a ${esc(job.company)}">🚩 Reportar</button>
+            </p>
+          </div>
+          <p class="job-salary">${salaryText(job)}<span>USD / mes</span></p>
+        </div>
+
+        <div class="meta-chips">
+          <span class="chip">${esc(job.modality)}</span>
+          <span class="chip">Nivel ${job.level}/10</span>
+          <span class="chip">${esc(job.contract)}</span>
+          <span class="chip">${esc(job.schedule)}</span>
+        </div>
+
+        <p class="job-desc">${esc(truncate(job.description, 160))}</p>
+
+        <div class="skill-list">
+          ${skills.slice(0, 5).map((skill) => `<span class="skill">${esc(skill)}</span>`).join('')}
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-ghost" type="button" data-detail="${esc(job.id)}">Ver oferta</button>
+          ${blocked
+            ? '<span class="btn btn-disabled" aria-disabled="true">Contacto bloqueado</span>'
+            : `<a class="btn btn-dark" href="${esc(contactHref(job))}" target="_blank" rel="noopener">Contactar directo</a>`}
+        </div>
+      </article>
+    `;
+  }
+
+  /* ================= Vista: publicar ================= */
+
+  function publishView() {
+    return `
+      <section class="page-head">
+        <span class="eyebrow">Para empresas</span>
+        <h1>Publica con las cartas sobre la mesa.</h1>
+        <p>Salario, experiencia, modalidad y contacto son obligatorios. Sin eso no hay publicación. Así de simple.</p>
+      </section>
+
+      <form id="job-form" class="form-card" novalidate>
+        <div class="form-note">
+          <strong>Regla de honestidad</strong>
+          <span>Si el salario no es real, la oferta no entra. Publicar es gratis y visible al instante.</span>
+        </div>
+
+        <div class="form-error" role="alert" tabindex="-1" hidden></div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="job-title">Cargo <span class="req">*</span></label>
+            <input id="job-title" name="title" type="text" maxlength="80" placeholder="Ej. Desarrollador Frontend Junior" required>
+          </div>
+
+          <div class="field">
+            <label for="job-company">Empresa <span class="req">*</span></label>
+            <input id="job-company" name="company" type="text" maxlength="80" placeholder="Ej. Nébula Studio" required>
+          </div>
+
+          <div class="field">
+            <label for="job-city">Ubicación <span class="req">*</span></label>
+            <select id="job-city" name="city" required>
+              <option value="">Selecciona ubicación</option>
+              ${PUBLISH_CITIES.map((city) => `<option value="${esc(city)}">${esc(city)}</option>`).join('')}
+            </select>
+            <small>Piloto: Guayaquil, Quito, Cuenca y remoto.</small>
+          </div>
+
+          <div class="field">
+            <label for="job-modality">Modalidad <span class="req">*</span></label>
+            <select id="job-modality" name="modality" required>
+              <option value="">Selecciona una modalidad</option>
+              ${MODALITIES.map((modality) => `<option value="${esc(modality)}">${esc(modality)}</option>`).join('')}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="job-level">Experiencia requerida <span class="req">*</span></label>
+            <select id="job-level" name="level" required>
+              <option value="">Nivel real (1–10)</option>
+              ${levelOptions()}
+            </select>
+            <small>Sin inflar el nivel: si es junior, es junior.</small>
+          </div>
+
+          <div class="field">
+            <label for="job-contract">Tipo de contratación <span class="req">*</span></label>
+            <select id="job-contract" name="contract" required>
+              ${CONTRACTS.map((contract) => `<option value="${esc(contract)}">${esc(contract)}</option>`).join('')}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="job-salary-min">Salario mínimo (USD) <span class="req">*</span></label>
+            <input id="job-salary-min" name="salaryMin" type="number" min="1" step="10" inputmode="decimal" placeholder="700" required>
+          </div>
+
+          <div class="field">
+            <label for="job-salary-max">Salario máximo (USD) <span class="req">*</span></label>
+            <input id="job-salary-max" name="salaryMax" type="number" min="1" step="10" inputmode="decimal" placeholder="950" required>
+          </div>
+
+          <div class="field">
+            <label for="job-schedule">Horario <span class="req">*</span></label>
+            <input id="job-schedule" name="schedule" type="text" maxlength="80" value="Lun–Vie · 9:00–18:00" required>
+          </div>
+
+          <div class="field">
+            <label for="job-contact-type">Tipo de contacto <span class="req">*</span></label>
+            <select id="job-contact-type" name="contactType" required>
+              <option value="email">Email</option>
+              <option value="whatsapp">WhatsApp</option>
+            </select>
+          </div>
+
+          <div class="field span-2">
+            <label for="job-contact">Contacto directo <span class="req">*</span></label>
+            <input id="job-contact" name="contact" type="text" maxlength="120" placeholder="hola@empresa.com o +593 99 123 4567" required>
+            <small>Contacto real. Sin formularios de diez pasos ni filtros automáticos.</small>
+          </div>
+
+          <div class="field">
+            <label for="job-source">Enlace a la oferta original (opcional)</label>
+            <input id="job-source" name="sourceUrl" type="url" maxlength="500" placeholder="https://linkedin.com/jobs/...">
+            <small>LinkedIn, CompuTrabajo u otro portal. Ayuda a verificar la oferta.</small>
+          </div>
+
+          <div class="field">
+            <label for="job-company-url">Sitio web o Instagram (opcional)</label>
+            <input id="job-company-url" name="companyUrl" type="url" maxlength="500" placeholder="https://instagram.com/empresa">
+            <small>Para que las personas conozcan a la empresa.</small>
+          </div>
+
+          <div class="field span-2">
+            <label for="job-skills">Habilidades clave</label>
+            <input id="job-skills" name="skills" type="text" maxlength="180" placeholder="JavaScript, CSS, Figma, comunicación">
+            <small>Sepáralas con comas. Sin palabras de moda.</small>
+          </div>
+
+          <div class="field span-2">
+            <label for="job-description">Descripción <span class="req">*</span></label>
+            <textarea id="job-description" name="description" maxlength="900" placeholder="Qué se necesita de verdad, qué se ofrece y cómo es el día a día." required></textarea>
+          </div>
+
+          <div class="field span-2">
+            <div class="check-row">
+              <label class="check" for="job-urgent">
+                <input id="job-urgent" name="urgent" type="checkbox">
+                <span>Marcar como FLASH JOB — urgente, 24–48 h</span>
+              </label>
+              <label class="check" for="job-featured">
+                <input id="job-featured" name="featured" type="checkbox">
+                <span>Destacar oferta — $5 (demo)</span>
+              </label>
+            </div>
+            <small>Flash cubre urgencias reales. Destacada aparece primero en el tablero.</small>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button class="btn btn-dark" type="submit">Publicar oferta</button>
+          <span class="form-hint">Gratis · visible al instante · sin comisiones</span>
+        </div>
+      </form>
+    `;
+  }
+
+  function levelOptions(selected) {
+    return Array.from({ length: 10 }, (_, index) => {
+      const level = index + 1;
+      return `<option value="${level}" ${Number(selected) === level ? 'selected' : ''}>Nivel ${level} · ${levelInfo(level).band}</option>`;
+    }).join('');
+  }
+
+  /* ================= Vista: talento ================= */
+
+  function talentView() {
+    return `
+      <section class="page-head">
+        <span class="eyebrow">Para empresas</span>
+        <h1>Talento que dice la verdad.</h1>
+        <p>Perfiles con nivel real, habilidades concretas y contacto directo. Busca, encuentra y escribe. Sin intermediarios.</p>
+      </section>
+
+      <div class="search-panel">
+        <span class="search-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.6-3.6"></path></svg>
+        </span>
+        <input id="talent-search" type="search" data-tfilter="q" value="${esc(state.talentFilters.q)}" placeholder="Busca por nombre, rol o habilidad..." aria-label="Buscar talento">
+      </div>
+
+      <div class="filters" role="group" aria-label="Filtros de talento">
+        <select class="filter-select" data-tfilter="modality" aria-label="Modalidad">
+          <option value="">Toda modalidad</option>
+          ${MODALITIES.map((modality) => `<option value="${esc(modality)}" ${state.talentFilters.modality === modality ? 'selected' : ''}>${esc(modality)}</option>`).join('')}
+        </select>
+        <select class="filter-select" data-tfilter="city" aria-label="Ubicación">
+          ${talentCityOptions()}
+        </select>
+        <button class="link-btn" type="button" data-clear-talent>Limpiar filtros</button>
+      </div>
+
+      <div class="results-head">
+        <span id="talent-count"></span>
+        <span class="tiny">Nivel autodeclarado · V1</span>
+      </div>
+
+      <div id="talent-grid" class="talent-grid"></div>
+    `;
+  }
+
+  function talentCityOptions() {
+    const cities = Array.from(new Set(getTalent().map((profile) => profile.city).filter(Boolean)))
+      .sort((a, b) => a.localeCompare(b, 'es'));
+    return `<option value="">Toda ubicación</option>` + cities.map((city) =>
+      `<option value="${esc(city)}" ${state.talentFilters.city === city ? 'selected' : ''}>${esc(city)}</option>`
+    ).join('');
+  }
+
+  function updateTalentResults() {
+    const grid = document.getElementById('talent-grid');
+    const count = document.getElementById('talent-count');
+    if (!grid) return;
+
+    const talent = filteredTalent();
+    if (count) count.textContent = `${talent.length} ${talent.length === 1 ? 'perfil' : 'perfiles'} · contacto directo`;
+
+    if (!talent.length) {
+      grid.innerHTML = `
+        <div class="empty">
+          <strong>No encontramos ese perfil.</strong>
+          <p>Prueba con otra habilidad, modalidad o ciudad.</p>
+          <button class="btn btn-dark" type="button" data-clear-talent>Limpiar filtros</button>
+        </div>
+      `;
+      return;
+    }
+
+    grid.innerHTML = talent.map(talentCard).join('');
+  }
+
+  function talentCard(profile) {
+    const level = Number(profile.level) || 1;
+    const skills = asList(profile.skills);
+
+    return `
+      <article class="talent-card${profile.isOwn ? ' is-own' : ''}">
+        <div class="talent-head">
+          <div class="avatar" aria-hidden="true">${esc(initials(profile.name))}</div>
+          <div>
+            <h3>${esc(profile.name)} ${profile.isOwn ? '<span class="own-flag">Tu perfil</span>' : ''} ${profile.cvName ? '<span class="verified-badge">✅ Verificado</span>' : ''}</h3>
+            <p>${esc(profile.role)} · ${esc(profile.city)}</p>
+          </div>
+          <span class="level-badge">N${level}</span>
+        </div>
+
+        <div class="level-track" role="progressbar" aria-valuemin="1" aria-valuemax="10" aria-valuenow="${level}" aria-label="Nivel de ${esc(profile.name)}">
+          <div style="width:${level * 10}%"></div>
+        </div>
+        <p class="level-caption">Nivel ${level}/10 · ${esc(levelInfo(level).band)}</p>
+
+        <div class="meta-chips">
+          <span class="chip">${esc(profile.modality)}</span>
+          <span class="chip">${esc(profile.availability)}</span>
+          <span class="chip">Aspira ${money(profile.salary)}</span>
+        </div>
+
+        <div class="skill-list">
+          ${skills.map((skill) => `<span class="skill">${esc(skill)}</span>`).join('')}
+        </div>
+
+        <p class="job-desc">${esc(truncate(profile.experience, 180))}</p>
+
+        <div class="talent-foot">
+          <span class="talent-contact">${esc(profile.contact)}</span>
+          <div class="talent-actions">
+            ${profile.cvName ? `<a class="cv-link" href="${esc(profile.cvData)}" download="${esc(profile.cvName)}">Ver CV</a>` : ''}
+            <a class="btn btn-dark" href="${esc(profileContactHref(profile))}" target="_blank" rel="noopener">Contactar</a>
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
+  /* ================= Vista: perfil ================= */
+
+  function profileView() {
+    const profile = state.profile;
+
+    if (!profile) {
+      return `
+        <section class="page-head">
+          <span class="eyebrow">Tu identidad honesta</span>
+          <h1>Crea tu perfil. Sin adornos.</h1>
+          <p>Nivel real, habilidades concretas, disponibilidad real. Las empresas te contactan directo, sin intermediarios.</p>
+        </section>
+        ${profileForm(null)}
+      `;
+    }
+
+    if (state.editingProfile) {
+      return `
+        <section class="page-head">
+          <span class="eyebrow">Tu identidad honesta</span>
+          <h1>Edita tu perfil.</h1>
+          <p>Actualiza tu nivel y disponibilidad. La honestidad también es mantenerse al día.</p>
+        </section>
+        ${profileForm(profile)}
+      `;
+    }
+
+    return `
+      <section class="page-head">
+        <span class="eyebrow">Tu identidad honesta</span>
+        <h1>Tu perfil está vivo.</h1>
+        <p>Así te ven las empresas: nivel, habilidades y contacto directo. Sin letra pequeña.</p>
+      </section>
+      ${profileCard(profile)}
+    `;
+  }
+
+  function profileForm(profile) {
+    const data = profile || {};
+    const level = Number(data.level) || 3;
+
+    return `
+      <form id="profile-form" class="form-card" novalidate>
+        <div class="form-note">
+          <strong>Nivel 1–10, sin inflar</strong>
+          <span>El nivel es autodeclarado en esta V1. Tu reputación empieza por decir la verdad.</span>
+        </div>
+
+        <div class="form-error" role="alert" tabindex="-1" hidden></div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="profile-name">Nombre <span class="req">*</span></label>
+            <input id="profile-name" name="name" type="text" maxlength="60" value="${esc(data.name)}" placeholder="Tu nombre" required>
+          </div>
+
+          <div class="field">
+            <label for="profile-role">Rol o especialidad <span class="req">*</span></label>
+            <input id="profile-role" name="role" type="text" maxlength="60" value="${esc(data.role)}" placeholder="Ej. Desarrollador frontend" required>
+          </div>
+
+          <div class="field">
+            <label for="profile-city">Ubicación <span class="req">*</span></label>
+            <input id="profile-city" name="city" type="text" list="cities-profile" maxlength="60" value="${esc(data.city)}" placeholder="Ciudad" required>
+            <datalist id="cities-profile">${CITIES.map((city) => `<option value="${esc(city)}"></option>`).join('')}</datalist>
+          </div>
+
+          <div class="field">
+            <label for="profile-modality">Modalidad preferida <span class="req">*</span></label>
+            <select id="profile-modality" name="modality" required>
+              ${MODALITIES.map((modality) => `<option value="${esc(modality)}" ${data.modality === modality ? 'selected' : ''}>${esc(modality)}</option>`).join('')}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="profile-availability">Disponibilidad <span class="req">*</span></label>
+            <select id="profile-availability" name="availability" required>
+              ${AVAILABILITIES.map((availability) => `<option value="${esc(availability)}" ${data.availability === availability ? 'selected' : ''}>${esc(availability)}</option>`).join('')}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="profile-salary">Aspiración salarial (USD/mes) <span class="req">*</span></label>
+            <input id="profile-salary" name="salary" type="number" min="1" step="10" inputmode="decimal" value="${data.salary ? esc(data.salary) : ''}" placeholder="900" required>
+          </div>
+
+          <div class="field">
+            <label for="profile-contact">Contacto directo <span class="req">*</span></label>
+            <input id="profile-contact" name="contact" type="text" maxlength="120" value="${esc(data.contact)}" placeholder="Email o WhatsApp" required>
+            <small>Las empresas te escriben directo. Sin mensajes que se pierden.</small>
+          </div>
+
+          <div class="field">
+            <label for="profile-level">Nivel de experiencia <span class="req">*</span></label>
+            <div class="range-wrap">
+              <input id="profile-level" name="level" type="range" min="1" max="10" step="1" value="${level}">
+              <output id="profile-level-label" class="range-value" for="profile-level">${level}/10 · ${levelInfo(level).band}</output>
+            </div>
+            <small>1 = primer empleo · 10 = experto referente.</small>
+          </div>
+
+          <div class="field span-2">
+            <label for="profile-skills">Habilidades reales <span class="req">*</span></label>
+            <input id="profile-skills" name="skills" type="text" maxlength="200" value="${esc(asList(data.skills).join(', '))}" placeholder="JavaScript, CSS, Figma, comunicación">
+            <small>Máximo 8. Sepáralas con comas. Sin relleno de palabras clave.</small>
+          </div>
+
+          <div class="field span-2">
+            <label for="profile-experience">Experiencia real <span class="req">*</span></label>
+            <textarea id="profile-experience" name="experience" maxlength="700" placeholder="Cuéntalo en 2–3 líneas: qué has hecho, con qué herramientas y qué resultado dejaste." required>${esc(data.experience)}</textarea>
+          </div>
+
+          <div class="field span-2">
+            <label for="profile-cv">CV (opcional · PDF o DOC, máx. 1.5 MB)</label>
+            <input id="profile-cv" name="cv" type="file" accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+            <small>${data.cvName ? `CV actual: ${esc(data.cvName)}. Subir otro lo reemplaza.` : 'Sube tu CV para obtener la insignia ✅ Verificado y +5 de karma.'}</small>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button class="btn btn-dark" type="submit">${profile ? 'Guardar cambios' : 'Crear mi perfil'}</button>
+          ${profile ? '<button class="btn btn-ghost" type="button" data-cancel-profile>Cancelar</button>' : ''}
+          <span class="form-hint">Gratis para siempre. Los trabajadores no pagan.</span>
+        </div>
+      </form>
+    `;
+  }
+
+  function profileCard(profile) {
+    const level = Number(profile.level) || 1;
+    const karma = getWorkerKarma(profile);
+    const karmaWidth = Math.min(100, Math.max(0, karma));
+
+    return `
+      <article class="profile-card">
+        <div class="profile-head">
+          <div class="avatar" aria-hidden="true">${esc(initials(profile.name))}</div>
+          <div>
+            <h2>${esc(profile.name)} ${profile.cvName ? '<span class="verified-badge">✅ Verificado</span>' : ''}</h2>
+            <p>${esc(profile.role)} · ${esc(profile.city)}</p>
+          </div>
+          <span class="level-badge">Nivel ${level}/10</span>
+        </div>
+
+        <div class="level-track" role="progressbar" aria-valuemin="1" aria-valuemax="10" aria-valuenow="${level}" aria-label="Nivel de experiencia">
+          <div style="width:${level * 10}%"></div>
+        </div>
+        <p class="level-caption">${esc(levelInfo(level).band)} · ${esc(levelInfo(level).detail)}</p>
+
+        <div class="karma-mini">
+          <div class="karma-mini-head"><span>Karma</span><strong>${karma}</strong></div>
+          <div class="karma-mini-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${karmaWidth}" aria-label="Karma ${karma} de 100"><div style="width:${karmaWidth}%"></div></div>
+        </div>
+
+        <div class="profile-grid">
+          ${profileStat('Disponibilidad', profile.availability)}
+          ${profileStat('Aspiración', `${money(profile.salary)} / mes`)}
+          ${profileStat('Modalidad', profile.modality)}
+          ${profileStat('Contacto', profile.contact)}
+        </div>
+
+        <h3 class="section-title">Habilidades</h3>
+        <div class="skill-list">
+          ${asList(profile.skills).map((skill) => `<span class="skill">${esc(skill)}</span>`).join('')}
+        </div>
+
+        <h3 class="section-title">Experiencia</h3>
+        <p class="profile-exp">${esc(profile.experience)}</p>
+
+        ${profile.cvName ? `
+          <h3 class="section-title">CV</h3>
+          <p class="cv-row"><span>✅ ${esc(profile.cvName)}</span>${profile.cvData ? `<a class="cv-link" href="${esc(profile.cvData)}" download="${esc(profile.cvName)}">Ver CV</a>` : ''}</p>
+        ` : ''}
+
+        <div class="form-actions">
+          <button class="btn btn-dark" type="button" data-edit-profile>Editar perfil</button>
+        </div>
+
+        <p class="honesty-note">Tu perfil es visible para empresas dentro de trato. El contacto es directo y sin intermediarios.</p>
+      </article>
+    `;
+  }
+
+  function profileStat(label, value) {
+    return `<div class="profile-stat"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`;
+  }
+
+  /* ================= Modal de oferta ================= */
+
+  function openJob(id) {
+    const job = state.jobs.find((item) => item.id === id);
+    if (!job) return;
+
+    const modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+
+    lastFocused = document.activeElement;
+    const match = state.profile ? matchScore(job, state.profile) : null;
+    const blocked = isCompanyBlocked(job.company);
+    const reports = reportCount(job.company);
+    const karma = getCompanyKarma(job.company);
+
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+          <div class="modal-head">
+            <div>
+              <div class="flag-group">
+                ${job.urgent
+                  ? '<span class="badge flash">⚡ FLASH JOB — 24–48H</span>'
+                  : '<span class="badge subtle">Oferta transparente</span>'}
+                ${job.featured ? '<span class="badge featured">★ Destacada</span>' : ''}
+                ${blocked ? '<span class="badge blocked">🚫 BLOQUEADA</span>' : ''}
+              </div>
+              <h2 id="modal-title">${esc(job.title)}</h2>
+              <p class="job-company">
+                <span>${esc(job.company)} · ${esc(job.city)}</span>
+                <span class="karma-pill" title="Karma de la empresa">Karma ${karma}</span>
+                ${reports ? `<span class="report-count">${reports}/3 reportes</span>` : ''}
+                <button class="report-link" type="button" data-report="${esc(job.company)}">🚩 Reportar</button>
+              </p>
+            </div>
+            <button class="modal-close" type="button" data-close aria-label="Cerrar">×</button>
+          </div>
+
+          <p class="modal-salary">${salaryText(job)} <span>USD / mes</span></p>
+
+          <div class="detail-grid">
+            ${detailItem('Experiencia', `Nivel ${job.level}/10 · ${levelInfo(job.level).band}`)}
+            ${detailItem('Modalidad', job.modality)}
+            ${detailItem('Ubicación', job.city)}
+            ${detailItem('Horario', job.schedule)}
+            ${detailItem('Contratación', job.contract)}
+            ${detailItem('Publicado', timeAgo(job.createdAt))}
+          </div>
+
+          ${blocked ? `
+            <div class="blocked-note" role="alert">
+              <strong>🚫 Empresa bloqueada.</strong> Acumuló 3 reportes de la comunidad. El contacto está deshabilitado.
+            </div>
+          ` : ''}
+
+          ${(job.sourceUrl || job.companyUrl) ? `
+            <div class="external-links">
+              ${job.sourceUrl ? `<a href="${esc(job.sourceUrl)}" target="_blank" rel="noopener">Ver oferta original ↗</a>` : ''}
+              ${job.companyUrl ? `<a href="${esc(job.companyUrl)}" target="_blank" rel="noopener">Sitio / Instagram de la empresa ↗</a>` : ''}
+            </div>
+          ` : ''}
+
+          ${match ? matchPanel(match) : `
+            <div class="match-box">
+              <strong>Tu match está a un perfil de distancia.</strong>
+              <p>Crea tu perfil para comparar habilidades, nivel, modalidad, ubicación y salario con esta oferta.</p>
+              <button class="btn btn-green" type="button" data-tab="profile">Crear perfil gratis</button>
+            </div>
+          `}
+
+          <h3 class="section-title">Descripción</h3>
+          <p class="detail-desc">${esc(job.description)}</p>
+
+          <h3 class="section-title">Habilidades clave</h3>
+          <div class="skill-list">
+            ${asList(job.skills).map((skill) => `<span class="skill">${esc(skill)}</span>`).join('') || '<span class="muted-text">No especificadas.</span>'}
+          </div>
+
+          <div class="contact-box">
+            <div>
+              <span>Contacto directo</span>
+              <strong>${esc(job.contact)}</strong>
+            </div>
+            ${blocked
+              ? '<span class="btn btn-disabled" aria-disabled="true">Contacto bloqueado</span>'
+              : `<a class="btn btn-dark" href="${esc(contactHref(job))}" target="_blank" rel="noopener">${job.contactType === 'whatsapp' ? 'Abrir WhatsApp' : 'Enviar email'}</a>`}
+          </div>
+
+          <p class="honesty-note">Esta oferta muestra salario, requisitos y contacto real. Sin letra pequeña.</p>
+        </div>
+      </div>
+    `;
+
+    document.body.classList.add('no-scroll');
+    const closeButton = modalRoot.querySelector('[data-close]');
+    if (closeButton) closeButton.focus();
+  }
+
+  function detailItem(label, value) {
+    return `<div class="detail-item"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`;
+  }
+
+  function matchPanel(match) {
+    return `
+      <div class="match-box">
+        <div class="match-head">
+          <strong>${match.score}% de match con tu perfil</strong>
+          <span>${match.reasons.length ? 'Coincidencias reales' : 'Aún sin coincidencias'}</span>
+        </div>
+        <div class="match-bar"><div style="width:${match.score}%"></div></div>
+        <p>${match.reasons.length ? match.reasons.map(esc).join(' · ') : 'Actualiza tus habilidades o tu nivel para mejorar la coincidencia.'}</p>
+      </div>
+    `;
+  }
+
+  function openReport(company) {
+    const name = String(company || '').trim();
+    if (!name) return;
+
+    closeModal();
+    lastFocused = document.activeElement;
+
+    const modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+
+    const blocked = isCompanyBlocked(name);
+    const count = reportCount(name);
+
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop">
+        <div class="modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-title">
+          <div class="modal-head">
+            <div>
+              <span class="badge subtle">Moderación</span>
+              <h2 id="report-title">Reportar a ${esc(name)}</h2>
+              <p class="job-company">${count}/3 reportes acumulados</p>
+            </div>
+            <button class="modal-close" type="button" data-close aria-label="Cerrar">×</button>
+          </div>
+
+          ${blocked ? `
+            <div class="blocked-note" role="alert">
+              <strong>🚫 Esta empresa ya está bloqueada.</strong> Acumuló 3 reportes y su contacto permanece deshabilitado.
+            </div>
+            <div class="form-actions">
+              <button class="btn btn-dark" type="button" data-close>Cerrar</button>
+            </div>
+          ` : `
+            <p class="muted-text">Tu reporte ayuda a mantener salarios y procesos honestos. La empresa pierde 15 de karma.</p>
+            <form id="report-form" data-company="${esc(name)}">
+              <div class="field">
+                <label for="report-reason">Motivo del reporte <span class="req">*</span></label>
+                <select id="report-reason" name="reason" required>
+                  <option value="">Selecciona un motivo</option>
+                  ${REPORT_REASONS.map((reason) => `<option value="${esc(reason)}">${esc(reason)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-actions">
+                <button class="btn btn-dark" type="submit">Enviar reporte</button>
+                <button class="btn btn-ghost" type="button" data-close>Cancelar</button>
+              </div>
+            </form>
+            <p class="honesty-note">Con 3 reportes la empresa queda bloqueada automáticamente en esta V1.</p>
+          `}
+        </div>
+      </div>
+    `;
+
+    document.body.classList.add('no-scroll');
+    const focusTarget = modalRoot.querySelector('select, [data-close]');
+    if (focusTarget) focusTarget.focus();
+  }
+
+  function sendReport(form) {
+    const company = String(form.dataset.company || '').trim();
+    const reason = String(new FormData(form).get('reason') || '').trim();
+    if (!company || !reason) return;
+
+    if (isCompanyBlocked(company)) {
+      closeModal();
+      toast('Esta empresa ya está bloqueada.');
+      return;
+    }
+
+    const key = companyKey(company);
+    const list = Array.isArray(state.reports[key]) ? state.reports[key] : [];
+    list.push({ id: uid(), reason, createdAt: Date.now() });
+    state.reports[key] = list;
+    saveReports();
+    adjustCompanyKarma(company, -15);
+
+    const count = list.length;
+    closeModal();
+    renderView();
+
+    if (count >= 3) {
+      toast(`🚫 ${company} fue bloqueada por 3 reportes.`);
+    } else {
+      toast(`Reporte enviado. ${company} tiene ${count}/3 reportes.`);
+    }
+  }
+
+  function closeModal() {
+    const modalRoot = document.getElementById('modal-root');
+    if (!modalRoot || !modalRoot.innerHTML) return;
+    modalRoot.innerHTML = '';
+    document.body.classList.remove('no-scroll');
+    if (lastFocused && typeof lastFocused.focus === 'function' && lastFocused.isConnected) {
+      lastFocused.focus();
+    }
+    lastFocused = null;
+  }
+
+  /* ================= Formularios ================= */
+
+  function handleSubmit(event) {
+    if (event.target.id === 'job-form') {
+      event.preventDefault();
+      publishJob(event.target);
+      return;
+    }
+    if (event.target.id === 'profile-form') {
+      event.preventDefault();
+      saveProfileFromForm(event.target);
+      return;
+    }
+    if (event.target.id === 'report-form') {
+      event.preventDefault();
+      sendReport(event.target);
+    }
+  }
+
+  function publishJob(form) {
+    const data = new FormData(form);
+    const value = (name) => String(data.get(name) || '').trim();
+
+    const title = value('title');
+    const company = value('company');
+    const city = value('city');
+    const modality = value('modality');
+    const level = Number(value('level'));
+    const contract = value('contract');
+    const salaryMin = Number(value('salaryMin'));
+    const salaryMax = Number(value('salaryMax'));
+    const schedule = value('schedule');
+    const contactType = value('contactType');
+    const contact = value('contact');
+    const sourceUrl = value('sourceUrl');
+    const companyUrl = value('companyUrl');
+    const description = value('description');
+    const skills = value('skills').split(',').map((skill) => skill.trim()).filter(Boolean).slice(0, 10);
+    const urgent = data.get('urgent') === 'on' || data.get('urgent') === 'true';
+    const featured = data.get('featured') === 'on' || data.get('featured') === 'true';
+
+    const errors = [];
+    if (!title) errors.push({ field: 'title', message: 'El cargo es obligatorio.' });
+    if (!company) errors.push({ field: 'company', message: 'La empresa es obligatoria.' });
+    if (company && isCompanyBlocked(company)) errors.push({ field: 'company', message: 'Esta empresa está bloqueada por 3 reportes. No puede publicar nuevas ofertas.' });
+    if (!city) errors.push({ field: 'city', message: 'La ubicación es obligatoria.' });
+    if (!modality) errors.push({ field: 'modality', message: 'La modalidad es obligatoria.' });
+    if (!level || level < 1 || level > 10) errors.push({ field: 'level', message: 'La experiencia debe ser un nivel real entre 1 y 10.' });
+    if (!contract) errors.push({ field: 'contract', message: 'El tipo de contratación es obligatorio.' });
+    if (!salaryMin || salaryMin <= 0) errors.push({ field: 'salaryMin', message: 'El salario mínimo debe ser mayor que cero.' });
+    if (!salaryMax || salaryMax <= 0) errors.push({ field: 'salaryMax', message: 'El salario máximo debe ser mayor que cero.' });
+    if (salaryMin && salaryMax && salaryMax < salaryMin) errors.push({ field: 'salaryMax', message: 'El salario máximo no puede ser menor que el mínimo.' });
+    if (!schedule) errors.push({ field: 'schedule', message: 'El horario es obligatorio.' });
+    if (!contact) errors.push({ field: 'contact', message: 'El contacto directo es obligatorio.' });
+    if (contact && contactType === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact)) errors.push({ field: 'contact', message: 'Escribe un email válido.' });
+    if (contact && contactType === 'whatsapp' && contact.replace(/\D/g, '').length < 7) errors.push({ field: 'contact', message: 'Escribe un número de WhatsApp válido.' });
+    if (sourceUrl && !isHttpUrl(sourceUrl)) errors.push({ field: 'sourceUrl', message: 'El enlace original debe iniciar con http:// o https://.' });
+    if (companyUrl && !isHttpUrl(companyUrl)) errors.push({ field: 'companyUrl', message: 'El sitio web debe iniciar con http:// o https://.' });
+    if (!description || description.length < 20) errors.push({ field: 'description', message: 'La descripción debe explicar la oferta (mínimo 20 caracteres).' });
+
+    if (errors.length) {
+      showFormErrors(form, errors, 'Revisa estos puntos antes de publicar:');
+      return;
+    }
+
+    state.jobs.unshift({
+      id: uid(),
+      title,
+      company,
+      salaryMin,
+      salaryMax,
+      level,
+      modality,
+      city,
+      schedule,
+      contract,
+      urgent,
+      featured,
+      expiresAt: urgent ? Date.now() + 48 * 3600000 : null,
+      description,
+      skills,
+      contactType,
+      contact,
+      sourceUrl,
+      companyUrl,
+      createdAt: Date.now()
+    });
+
+    adjustCompanyKarma(company, 2);
+    saveJobs();
+    state.filters = defaultFilters();
+    state.tab = 'jobs';
+    state.editingProfile = false;
+    renderView();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    toast('Oferta publicada. Salario, requisitos y contacto a la vista.');
+  }
+
+  async function saveProfileFromForm(form) {
+    const data = new FormData(form);
+    const value = (name) => String(data.get(name) || '').trim();
+
+    const name = value('name');
+    const role = value('role');
+    const city = value('city');
+    const modality = value('modality');
+    const availability = value('availability');
+    const salary = Number(value('salary'));
+    const contact = value('contact');
+    const level = Number(value('level'));
+    const skills = value('skills').split(',').map((skill) => skill.trim()).filter(Boolean).slice(0, 8);
+    const experience = value('experience');
+
+    const errors = [];
+    if (!name) errors.push({ field: 'name', message: 'El nombre es obligatorio.' });
+    if (!role) errors.push({ field: 'role', message: 'El rol o especialidad es obligatorio.' });
+    if (!city) errors.push({ field: 'city', message: 'La ubicación es obligatoria.' });
+    if (!modality) errors.push({ field: 'modality', message: 'La modalidad preferida es obligatoria.' });
+    if (!availability) errors.push({ field: 'availability', message: 'La disponibilidad es obligatoria.' });
+    if (!salary || salary <= 0) errors.push({ field: 'salary', message: 'La aspiración salarial debe ser mayor que cero.' });
+    if (!contact) errors.push({ field: 'contact', message: 'El contacto directo es obligatorio.' });
+    if (contact && contact.includes('@') && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact)) errors.push({ field: 'contact', message: 'Escribe un email válido.' });
+    if (contact && !contact.includes('@') && contact.replace(/\D/g, '').length < 7) errors.push({ field: 'contact', message: 'Escribe un email o WhatsApp válido.' });
+    if (!level || level < 1 || level > 10) errors.push({ field: 'level', message: 'El nivel debe estar entre 1 y 10.' });
+    if (!skills.length) errors.push({ field: 'skills', message: 'Agrega al menos una habilidad real.' });
+    if (!experience || experience.length < 20) errors.push({ field: 'experience', message: 'Cuenta tu experiencia en al menos 20 caracteres.' });
+
+    let cvName = state.profile ? String(state.profile.cvName || '') : '';
+    let cvData = state.profile ? String(state.profile.cvData || '') : '';
+    let cvType = state.profile ? String(state.profile.cvType || '') : '';
+    const cvInput = form.elements.namedItem('cv');
+    const cvFile = cvInput && cvInput.files ? cvInput.files[0] : null;
+
+    if (cvFile) {
+      if (cvFile.size > 1.5 * 1024 * 1024) {
+        errors.push({ field: 'cv', message: 'El CV debe pesar menos de 1.5 MB.' });
+      } else {
+        try {
+          cvData = await readFileAsDataURL(cvFile);
+          cvName = cvFile.name;
+          cvType = cvFile.type || 'application/octet-stream';
+        } catch (error) {
+          errors.push({ field: 'cv', message: 'No se pudo leer el CV. Intenta con otro archivo.' });
+        }
+      }
+    }
+
+    if (errors.length) {
+      showFormErrors(form, errors, 'Revisa estos puntos antes de guardar:');
+      return;
+    }
+
+    state.profile = {
+      id: state.profile ? state.profile.id : uid(),
+      name,
+      role,
+      level,
+      city,
+      availability,
+      salary,
+      modality,
+      contact,
+      skills,
+      experience,
+      cvName,
+      cvData,
+      cvType,
+      karma: 100 + (cvName ? 5 : 0),
+      createdAt: state.profile ? state.profile.createdAt : Date.now()
+    };
+
+    saveProfile();
+    state.editingProfile = false;
+    state.tab = 'profile';
+    renderView();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    toast('Perfil guardado. Ya eres parte del talento honesto.');
+  }
+
+  function showFormErrors(form, errors, intro) {
+    const box = form.querySelector('.form-error');
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = `<strong>${esc(intro)}</strong><ul>${errors.map((error) => `<li>${esc(error.message)}</li>`).join('')}</ul>`;
+      box.focus({ preventScroll: true });
+      box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    form.querySelectorAll('.field').forEach((field) => field.classList.remove('invalid'));
+
+    errors.forEach((error) => {
+      const control = form.elements.namedItem(error.field);
+      if (control && control.closest) {
+        const field = control.closest('.field');
+        if (field) field.classList.add('invalid');
+        control.setAttribute('aria-invalid', 'true');
+      }
+    });
+  }
+
+  /* ================= Filtros interactivos ================= */
+
+  function clearFilters() {
+    state.filters = defaultFilters();
+    const search = document.getElementById('search');
+    if (search) search.value = '';
+    $$('[data-filter]').forEach((control) => {
+      if (control.tagName === 'SELECT') control.value = '';
+    });
+    const urgentButton = document.querySelector('[data-toggle-urgent]');
+    if (urgentButton) urgentButton.setAttribute('aria-pressed', 'false');
+    updateJobResults();
+  }
+
+  function resetDemo() {
+    if (!window.confirm('¿Reiniciar la demo? Se borrarán las ofertas y el perfil guardados en este navegador.')) return;
+
+    try {
+      localStorage.removeItem(STORAGE_JOBS);
+      localStorage.removeItem(STORAGE_PROFILE);
+      localStorage.removeItem(STORAGE_REPORTS);
+      localStorage.removeItem(STORAGE_KARMA);
+    } catch (error) {
+      /* Sin almacenamiento disponible: igual reiniciamos en memoria. */
+    }
+
+    state.jobs = seedJobs();
+    state.profile = null;
+    state.reports = {};
+    state.companyKarma = {};
+    state.filters = defaultFilters();
+    state.talentFilters = defaultTalentFilters();
+    state.tab = 'jobs';
+    state.editingProfile = false;
+    closeModal();
+    renderView();
+    toast('Demo reiniciada con datos de ejemplo.');
+  }
+
+  /* ================= Eventos ================= */
+
+  function handleClick(event) {
+    if (event.target.closest('[data-close]') || event.target.classList.contains('modal-backdrop')) {
+      closeModal();
+      return;
+    }
+
+    const tabButton = event.target.closest('[data-tab]');
+    if (tabButton) {
+      event.preventDefault();
+      setTab(tabButton.dataset.tab);
+      return;
+    }
+
+    const reportButton = event.target.closest('[data-report]');
+    if (reportButton) {
+      event.preventDefault();
+      openReport(reportButton.dataset.report);
+      return;
+    }
+
+    const detailButton = event.target.closest('[data-detail]');
+    if (detailButton) {
+      openJob(detailButton.dataset.detail);
+      return;
+    }
+
+    const urgentButton = event.target.closest('[data-toggle-urgent]');
+    if (urgentButton) {
+      state.filters.urgent = !state.filters.urgent;
+      urgentButton.setAttribute('aria-pressed', String(state.filters.urgent));
+      updateJobResults();
+      return;
+    }
+
+    if (event.target.closest('[data-clear-filters]')) {
+      clearFilters();
+      return;
+    }
+
+    if (event.target.closest('[data-clear-talent]')) {
+      state.talentFilters = defaultTalentFilters();
+      renderView();
+      return;
+    }
+
+    if (event.target.closest('[data-edit-profile]')) {
+      state.editingProfile = true;
+      renderView();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    if (event.target.closest('[data-cancel-profile]')) {
+      state.editingProfile = false;
+      renderView();
+      return;
+    }
+
+    if (event.target.closest('[data-reset]')) {
+      resetDemo();
+    }
+  }
+
+  function handleInput(event) {
+    const target = event.target;
+
+    if (target.dataset.filter) {
+      const key = target.dataset.filter;
+      state.filters[key] = key === 'urgent' ? Boolean(target.checked) : target.value;
+      updateJobResults();
+    }
+
+    if (target.dataset.tfilter) {
+      state.talentFilters[target.dataset.tfilter] = target.value;
+      updateTalentResults();
+    }
+
+    if (target.id === 'profile-level') {
+      const label = document.getElementById('profile-level-label');
+      if (label) label.textContent = `${target.value}/10 · ${levelInfo(target.value).band}`;
+    }
+  }
+
+  function toast(message) {
+    const node = document.getElementById('toast');
+    if (!node) return;
+    node.textContent = message;
+    node.classList.add('show');
+    clearTimeout(toastTimeout);
+    toastTimeout = window.setTimeout(() => node.classList.remove('show'), 3400);
+  }
+
+  function bindEvents() {
+    app.addEventListener('click', handleClick);
+    app.addEventListener('input', handleInput);
+    app.addEventListener('change', handleInput);
+    app.addEventListener('submit', handleSubmit);
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') closeModal();
+    });
+  }
+
+  /* ================= Estilos ================= */
+
+  function injectStyles() {
+    if (document.getElementById('trato-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'trato-styles';
+    style.textContent = `
+      :root {
+        --paper: #f5f3ec;
+        --paper-2: #fbfaf6;
+        --card: #ffffff;
+        --ink: #101612;
+        --muted: #667068;
+        --line: #e1ded3;
+        --green: #1d7a4c;
+        --green-dark: #135c38;
+        --green-soft: #e8f4ed;
+        --lime: #d9f36e;
+        --orange: #e65b24;
+        --orange-soft: #fff1e8;
+        --shadow: 0 18px 45px rgba(16, 22, 18, 0.08);
+        --radius: 22px;
+      }
+
+      *, *::before, *::after { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        background:
+          radial-gradient(900px 500px at 85% -10%, rgba(217, 243, 110, 0.35), transparent 60%),
+          var(--paper);
+        color: var(--ink);
+        font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        line-height: 1.5;
+      }
+      ::selection { background: var(--lime); color: var(--ink); }
+      button, input, select, textarea { font: inherit; }
+      button { cursor: pointer; }
+      a { color: inherit; }
+      .container { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+
+      .site-header {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        background: rgba(245, 243, 236, 0.82);
+        backdrop-filter: blur(16px);
+        border-bottom: 1px solid rgba(225, 222, 211, 0.8);
+      }
+      .header-inner { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 70px; }
+      .logo {
+        flex: none;
+        background: none;
+        border: 0;
+        padding: 0;
+        color: var(--ink);
+        font-size: 1.7rem;
+        font-weight: 900;
+        letter-spacing: -0.07em;
+        line-height: 1;
+      }
+      .logo span { color: var(--green); }
+      .nav { display: flex; align-items: center; gap: 2px; min-width: 0; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+      .nav::-webkit-scrollbar { display: none; }
+      .nav button {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        border-radius: 999px;
+        padding: 9px 12px;
+        font-size: 0.86rem;
+        font-weight: 700;
+        white-space: nowrap;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .nav button:hover { background: #eae7dd; color: var(--ink); }
+      .nav button[aria-current="page"] { background: var(--ink); color: #fff; }
+
+      .hero { max-width: 900px; padding: 58px 0 20px; }
+      .eyebrow { display: inline-block; margin-bottom: 14px; color: var(--green); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.2em; text-transform: uppercase; }
+      .hero h1 { margin: 0; font-size: clamp(2.7rem, 7.5vw, 5rem); font-weight: 900; line-height: 0.95; letter-spacing: -0.07em; }
+      .hero h1 em { font-style: normal; padding: 0 0.06em; background: linear-gradient(180deg, transparent 58%, var(--lime) 58%, var(--lime) 92%, transparent 92%); }
+      .hero > p { max-width: 620px; margin: 20px 0 0; color: #4d564f; font-size: 1.05rem; line-height: 1.6; }
+      .hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+      .hero-stats { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 28px; color: var(--muted); font-size: 0.82rem; }
+      .hero-stats strong { color: var(--ink); font-weight: 850; }
+
+      .profile-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 18px 0 0;
+        padding: 14px 16px;
+        background: var(--green-soft);
+        border: 1px solid #cfe6d9;
+        border-radius: 16px;
+      }
+      .profile-banner p { margin: 0; color: #22563a; font-size: 0.9rem; }
+      .profile-banner strong { font-weight: 850; }
+
+      .search-panel {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px 0 16px;
+        padding: 8px 8px 8px 14px;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        box-shadow: var(--shadow);
+      }
+      .search-icon { display: flex; flex: none; width: 20px; height: 20px; color: var(--muted); }
+      .search-icon svg { width: 100%; height: 100%; }
+      .search-panel input { flex: 1; min-width: 0; padding: 12px 4px; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 1rem; }
+      .search-panel input::placeholder { color: #98a099; }
+
+      .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0 14px; }
+      .filter-select {
+        appearance: none;
+        padding: 10px 34px 10px 14px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background-color: var(--card);
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%236b716c' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 12px center;
+        background-size: 12px 8px;
+        color: var(--ink);
+        font-size: 0.82rem;
+        font-weight: 700;
+      }
+      .filter-select:focus { border-color: var(--green); outline: none; box-shadow: 0 0 0 3px rgba(29, 122, 76, 0.12); }
+      .chip-toggle {
+        padding: 10px 14px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--card);
+        color: var(--ink);
+        font-size: 0.82rem;
+        font-weight: 750;
+        transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+      }
+      .chip-toggle[aria-pressed="true"] { background: var(--orange-soft); border-color: #f1b89e; color: #9a3a0f; }
+
+      .results-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: 4px 0 14px; color: var(--muted); font-size: 0.82rem; font-weight: 600; }
+      .link-btn { padding: 0; border: 0; background: none; color: var(--green); font-size: 0.82rem; font-weight: 800; text-decoration: underline; text-underline-offset: 3px; }
+      .tiny { color: #8a938c; font-size: 0.72rem; }
+
+      .job-grid, .talent-grid { display: grid; grid-template-columns: 1fr; gap: 14px; padding-bottom: 50px; }
+      .job-card, .talent-card {
+        display: flex;
+        flex-direction: column;
+        gap: 13px;
+        padding: 20px;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+      }
+      .job-card:hover, .talent-card:hover { transform: translateY(-3px); border-color: #cfcab9; box-shadow: var(--shadow); }
+      .job-card.is-urgent { background: linear-gradient(180deg, #fff9f4 0%, #fff 55%); border-color: #f0c0a7; }
+      .talent-card.is-own { background: linear-gradient(180deg, #f4fbf6 0%, #fff 60%); border-color: #b9dfc7; }
+      .job-card.is-blocked { border-color: #dfb9a9; background: #fdfaf8; }
+      .flag-group { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+      .card-flags { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; min-height: 24px; }
+      .badge { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 999px; font-size: 0.66rem; font-weight: 850; letter-spacing: 0.03em; line-height: 1.2; }
+      .badge.flash { background: var(--orange); color: #fff; }
+      .badge.subtle { background: var(--green-soft); color: var(--green-dark); }
+      .badge.match { background: var(--lime); color: #2d3a12; }
+      .badge.featured { background: var(--lime); color: #2d3a12; }
+      .badge.blocked { background: var(--ink); color: #fff; }
+
+      .job-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+      .job-heading h3 { margin: 0 0 4px; font-size: 1.15rem; line-height: 1.25; letter-spacing: -0.025em; }
+      .job-company { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; color: var(--muted); font-size: 0.82rem; }
+      .karma-pill { padding: 2px 7px; border-radius: 999px; background: var(--green-soft); color: var(--green-dark); font-size: 0.62rem; font-weight: 850; white-space: nowrap; }
+      .report-count { color: #9a3a0f; font-size: 0.66rem; font-weight: 750; white-space: nowrap; }
+      .report-link { padding: 0; border: 0; background: none; color: #7b857d; font-size: 0.68rem; font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+      .report-link:hover { color: var(--orange); }
+      .job-salary { margin: 0; text-align: right; white-space: nowrap; font-size: 1.05rem; font-weight: 900; letter-spacing: -0.02em; }
+      .job-salary span { display: block; margin-top: 2px; color: var(--muted); font-size: 0.6rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+
+      .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+      .chip { padding: 5px 9px; border-radius: 999px; background: #f2f0e8; color: #4a534c; font-size: 0.7rem; font-weight: 700; }
+      .skill-list { display: flex; flex-wrap: wrap; gap: 6px; }
+      .skill { padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: #3e4841; font-size: 0.7rem; font-weight: 700; }
+      .job-desc { display: -webkit-box; overflow: hidden; margin: 0; color: #59635c; font-size: 0.86rem; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+      .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 4px; }
+      .card-actions .btn { flex: 1; min-width: 130px; }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        padding: 11px 16px;
+        border: 1px solid transparent;
+        border-radius: 999px;
+        font-size: 0.86rem;
+        font-weight: 800;
+        text-decoration: none;
+        white-space: nowrap;
+        transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+      }
+      .btn:hover { transform: translateY(-1px); }
+      .btn:active { transform: none; }
+      .btn-dark { background: var(--ink); color: #fff; }
+      .btn-dark:hover { background: #000; }
+      .btn-green { background: var(--green); color: #fff; }
+      .btn-green:hover { background: var(--green-dark); }
+      .btn-ghost { background: transparent; border-color: var(--line); color: var(--ink); }
+      .btn-ghost:hover { background: #fff; border-color: #c9c4b4; }
+      .btn-disabled { border-color: var(--line); background: #eeebe1; color: #8a938c; cursor: not-allowed; }
+      .btn-disabled:hover { transform: none; }
+
+      .talent-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+      .avatar { display: grid; flex: none; place-items: center; width: 54px; height: 54px; border-radius: 50%; background: var(--ink); color: #fff; font-size: 1rem; font-weight: 900; letter-spacing: -0.02em; }
+      .talent-head h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0; font-size: 1.08rem; }
+      .talent-head p { margin: 2px 0 0; color: var(--muted); font-size: 0.8rem; }
+      .level-badge { margin-left: auto; padding: 6px 11px; border-radius: 999px; background: var(--lime); color: #2d3a12; font-size: 0.75rem; font-weight: 900; white-space: nowrap; }
+      .own-flag { padding: 3px 8px; border-radius: 999px; background: var(--green-soft); color: var(--green-dark); font-size: 0.6rem; font-weight: 850; letter-spacing: 0.02em; }
+      .verified-badge { padding: 3px 8px; border-radius: 999px; background: var(--green-soft); color: var(--green-dark); font-size: 0.6rem; font-weight: 850; letter-spacing: 0.02em; white-space: nowrap; }
+      .level-track { height: 9px; overflow: hidden; border-radius: 999px; background: #eeebe1; }
+      .level-track > div { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--green), #7acb4f); }
+      .level-caption { margin: -4px 0 2px; color: var(--muted); font-size: 0.74rem; font-weight: 650; }
+      .karma-mini { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0 2px; }
+      .karma-mini-head { display: flex; align-items: baseline; gap: 5px; color: var(--muted); font-size: 0.66rem; font-weight: 850; letter-spacing: 0.06em; text-transform: uppercase; }
+      .karma-mini-head strong { color: var(--green-dark); font-size: 0.8rem; letter-spacing: 0; }
+      .karma-mini-track { flex: 1; min-width: 90px; height: 6px; overflow: hidden; border-radius: 999px; background: #e6e3d8; }
+      .karma-mini-track > div { height: 100%; border-radius: 999px; background: var(--green); }
+      .talent-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .cv-link { color: var(--green); font-size: 0.7rem; font-weight: 850; text-decoration: underline; text-underline-offset: 2px; }
+      .cv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0; color: #4c554e; font-size: 0.82rem; }
+      .talent-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; padding-top: 4px; }
+      .talent-contact { color: var(--muted); font-size: 0.72rem; word-break: break-word; }
+
+      .empty { grid-column: 1 / -1; padding: 44px 22px; border: 1px dashed #cfc9b8; border-radius: var(--radius); background: rgba(255, 255, 255, 0.5); color: var(--muted); text-align: center; }
+      .empty strong { display: block; margin-bottom: 6px; color: var(--ink); font-size: 1.05rem; }
+      .empty p { margin: 0 0 16px; font-size: 0.9rem; }
+
+      .page-head { max-width: 820px; padding: 46px 0 6px; }
+      .page-head h1 { margin: 0 0 12px; font-size: clamp(2rem, 5.5vw, 3.5rem); font-weight: 900; line-height: 1; letter-spacing: -0.06em; }
+      .page-head p { max-width: 620px; margin: 0; color: #4f5952; font-size: 1rem; line-height: 1.6; }
+
+      .form-card { margin: 20px 0 50px; padding: 22px; background: var(--card); border: 1px solid var(--line); border-radius: 26px; box-shadow: var(--shadow); }
+      .form-note { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; margin-bottom: 18px; padding: 11px 14px; border: 1px solid #cfe6d9; border-radius: 14px; background: var(--green-soft); color: #24563a; font-size: 0.82rem; }
+      .form-note strong { color: var(--green-dark); font-weight: 900; }
+      .form-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+      .span-2 { grid-column: 1 / -1; }
+      .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+      .field label { color: #2d352f; font-size: 0.78rem; font-weight: 850; letter-spacing: 0.01em; }
+      .field .req { color: var(--orange); }
+      .field input, .field select, .field textarea {
+        width: 100%;
+        padding: 11px 12px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--paper-2);
+        color: var(--ink);
+        font-size: 0.92rem;
+        outline: none;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+      }
+      .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--green); background: #fff; box-shadow: 0 0 0 3px rgba(29, 122, 76, 0.12); }
+      .field textarea { min-height: 110px; resize: vertical; }
+      .field small { color: var(--muted); font-size: 0.72rem; line-height: 1.4; }
+      .field.invalid input, .field.invalid select, .field.invalid textarea { border-color: #c2410c; background: #fff8f4; box-shadow: 0 0 0 3px rgba(194, 65, 12, 0.1); }
+      .field label.check { display: flex; align-items: flex-start; gap: 9px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper-2); color: var(--ink); font-size: 0.86rem; font-weight: 700; cursor: pointer; }
+      .check input { flex: none; width: 18px; height: 18px; margin-top: 1px; accent-color: var(--green); }
+      .field.invalid .check { border-color: #c2410c; }
+      .check-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+      .field input[type="file"] { padding: 9px 12px; font-size: 0.8rem; cursor: pointer; }
+      .range-wrap { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper-2); }
+      .field input[type="range"] { flex: 1; padding: 0; border: 0; background: transparent; box-shadow: none; accent-color: var(--green); }
+      .range-value { min-width: 130px; color: var(--green-dark); font-size: 0.78rem; font-weight: 850; text-align: right; white-space: nowrap; }
+      .form-error { margin: 0 0 16px; padding: 12px 14px; border: 1px solid #f2c3a8; border-radius: 14px; background: #fff3eb; color: #8f3410; font-size: 0.84rem; line-height: 1.5; }
+      .form-error strong { font-weight: 900; }
+      .form-error ul { margin: 6px 0 0; padding-left: 18px; }
+      .form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 20px; }
+      .form-hint { color: var(--muted); font-size: 0.76rem; font-weight: 600; }
+
+      .profile-card { max-width: 900px; margin: 20px 0 50px; padding: 24px; background: var(--card); border: 1px solid var(--line); border-radius: 28px; box-shadow: var(--shadow); }
+      .profile-head { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+      .profile-head h2 { margin: 0; font-size: 1.55rem; letter-spacing: -0.04em; }
+      .profile-head p { margin: 2px 0 0; color: var(--muted); font-size: 0.86rem; }
+      .profile-card .level-track { margin-top: 20px; }
+      .profile-card .level-caption { margin: 8px 0 0; }
+      .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0; }
+      .profile-stat { min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper-2); }
+      .profile-stat span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 0.62rem; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+      .profile-stat strong { display: block; font-size: 0.82rem; font-weight: 800; word-break: break-word; }
+      .profile-exp { margin: 0 0 8px; color: #4c554e; font-size: 0.9rem; line-height: 1.65; white-space: pre-line; }
+      .section-title { margin: 20px 0 8px; color: var(--muted); font-size: 0.8rem; font-weight: 850; letter-spacing: 0.1em; text-transform: uppercase; }
+
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 120;
+        display: flex;
+        align-items: flex-end;
+        justify-content: center;
+        padding: 0;
+        background: rgba(12, 17, 14, 0.55);
+        backdrop-filter: blur(5px);
+        animation: fadeIn 0.18s ease;
+      }
+      .modal { position: relative; width: min(760px, 100%); max-height: 92vh; overflow-y: auto; padding: 22px; background: var(--paper); border-radius: 26px 26px 0 0; animation: slideUp 0.22s ease; }
+      .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+      .modal-head h2 { margin: 10px 0 4px; font-size: clamp(1.5rem, 4vw, 2rem); line-height: 1.1; letter-spacing: -0.04em; }
+      .modal-close { display: grid; flex: none; place-items: center; width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 50%; background: var(--card); color: var(--ink); font-size: 1.4rem; line-height: 1; }
+      .modal-close:hover { border-color: #c9c4b4; background: #fff; }
+      .modal-salary { margin: 16px 0 4px; font-size: 1.5rem; font-weight: 900; letter-spacing: -0.03em; }
+      .modal-salary span { color: var(--muted); font-size: 0.66rem; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+      .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0; }
+      .detail-item { min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+      .detail-item span { display: block; margin-bottom: 3px; color: var(--muted); font-size: 0.6rem; font-weight: 850; letter-spacing: 0.07em; text-transform: uppercase; }
+      .detail-item strong { display: block; font-size: 0.78rem; font-weight: 800; line-height: 1.3; word-break: break-word; }
+      .external-links { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 0 0 4px; }
+      .external-links a { color: var(--green); font-size: 0.74rem; font-weight: 850; text-decoration: underline; text-underline-offset: 2px; }
+      .blocked-note { margin: 14px 0 0; padding: 11px 13px; border: 1px solid #f1b89e; border-radius: 12px; background: var(--orange-soft); color: #8f3410; font-size: 0.8rem; line-height: 1.5; }
+      .blocked-note strong { font-weight: 900; }
+      .report-modal { width: min(540px, 100%); }
+      .report-modal .field { margin: 14px 0 0; }
+      .match-box { margin: 16px 0; padding: 14px; border: 1px solid #cde5d7; border-radius: 16px; background: var(--green-soft); }
+      .match-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 10px; }
+      .match-head strong { color: var(--green-dark); font-size: 0.92rem; }
+      .match-head span { color: #5a7c68; font-size: 0.66rem; font-weight: 850; letter-spacing: 0.06em; text-transform: uppercase; }
+      .match-bar { height: 8px; overflow: hidden; margin: 10px 0 8px; border-radius: 999px; background: #d4e8db; }
+      .match-bar > div { height: 100%; border-radius: 999px; background: var(--green); }
+      .match-box p { margin: 0; color: #2e5e45; font-size: 0.78rem; line-height: 1.5; }
+      .detail-desc { margin: 0; color: #424c45; font-size: 0.92rem; line-height: 1.7; white-space: pre-line; }
+      .contact-box { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 22px 0 12px; padding: 15px 16px; border-radius: 16px; background: var(--ink); color: #fff; }
+      .contact-box span { display: block; margin-bottom: 4px; color: #aab7ae; font-size: 0.6rem; font-weight: 850; letter-spacing: 0.1em; text-transform: uppercase; }
+      .contact-box strong { font-size: 0.9rem; word-break: break-word; }
+      .contact-box .btn { background: #fff; color: var(--ink); }
+      .honesty-note { margin: 14px 0 0; color: #7b857d; font-size: 0.72rem; line-height: 1.5; }
+      .muted-text { color: var(--muted); font-size: 0.8rem; }
+
+      .site-footer { padding: 28px 0 40px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.78rem; }
+      .ad-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 26px; padding: 10px 14px; border: 1px dashed var(--line); border-radius: 14px; color: #7b857d; font-size: 0.72rem; }
+      .ad-strip .ad-tag { padding: 2px 7px; border-radius: 999px; background: #eeebe1; color: var(--muted); font-size: 0.56rem; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+      .ad-strip a { margin-left: auto; color: var(--green); font-weight: 850; text-decoration: underline; text-underline-offset: 2px; }
+      .footer-inner { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 18px; }
+      .footer-inner strong { color: var(--ink); font-size: 1rem; letter-spacing: -0.03em; }
+      .footer-links { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+      .footer-links .link-btn { font-size: 0.72rem; }
+
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 22px;
+        z-index: 200;
+        max-width: calc(100vw - 32px);
+        padding: 12px 18px;
+        border-radius: 999px;
+        background: var(--ink);
+        color: #fff;
+        font-size: 0.82rem;
+        font-weight: 700;
+        text-align: center;
+        opacity: 0;
+        pointer-events: none;
+        transform: translate(-50%, 16px);
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        box-shadow: 0 14px 36px rgba(0, 0, 0, 0.25);
+      }
+      .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+      .no-scroll { overflow: hidden; }
+      :focus-visible { outline: 3px solid rgba(29, 122, 76, 0.4); outline-offset: 2px; }
+
+      @media (min-width: 720px) {
+        .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .check-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .profile-grid { grid-template-columns: repeat(4, 1fr); }
+        .footer-links { align-items: flex-end; text-align: right; }
+        .modal-backdrop { align-items: center; padding: 24px; }
+        .modal { border-radius: 26px; padding: 28px; }
+      }
+      @media (min-width: 780px) {
+        .job-grid, .talent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (min-width: 560px) {
+        .detail-grid { grid-template-columns: repeat(3, 1fr); }
+      }
+      @media (max-width: 640px) {
+        .header-inner { min-height: 62px; }
+        .hero { padding-top: 40px; }
+        .hero-stats { gap: 8px 16px; }
+        .job-heading { flex-direction: column; gap: 6px; }
+        .job-salary { text-align: left; }
+        .form-card, .profile-card, .modal { padding: 18px; }
+        .modal-backdrop .modal { border-radius: 22px 22px 0 0; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  /* ================= Arranque ================= */
+
+  function boot() {
+    app = document.getElementById('app');
+    if (!app) {
+      app = document.createElement('div');
+      app.id = 'app';
+      document.body.appendChild(app);
+    }
+
+    if (!document.querySelector('meta[name="viewport"]')) {
+      const viewport = document.createElement('meta');
+      viewport.name = 'viewport';
+      viewport.content = 'width=device-width, initial-scale=1';
+      document.head.appendChild(viewport);
+    }
+
+    injectStyles();
+    loadState();
+    buildShell();
+    bindEvents();
+    renderView();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
